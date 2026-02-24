@@ -24,10 +24,17 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
+      - name: Debug Repository Structure
+        run: |
+          echo "===== Repo Root ====="
+          ls -la
+          echo "===== DB Folder ====="
+          ls -la db || true
+
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq unzip
+          sudo apt-get install -y jq unzip curl
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
@@ -41,9 +48,9 @@ jobs:
 
       - name: Passive Subdomain Discovery
         run: |
-          if [ ! -f targets.txt ]; then
-            echo "Error: targets.txt not found!"
-            exit 1
+          if [ ! -f db/targets.txt ]; then
+            echo "No db/targets.txt found. Skipping recon safely."
+            exit 0
           fi
 
           TMP_DIR=$(mktemp -d)
@@ -53,32 +60,46 @@ jobs:
 
           while IFS= read -r domain || [ -n "$domain" ]; do
             [ -z "$domain" ] && continue
-            
+
+            echo "Recon on: $domain"
+
             # crt.sh
             curl -s --max-time 40 "https://crt.sh/?q=%25.${domain}&output=json" \
-              | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' >> "$TMP_DIR/crt.txt" || true
+              | jq -r '.[].name_value' 2>/dev/null \
+              | sed 's/\*\.//g' >> "$TMP_DIR/crt.txt" || true
 
             # THC
             curl -s --max-time 30 "https://ip.thc.org/sb/${domain}" \
               | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" >> "$TMP_DIR/thc.txt" || true
-            
+
             # Subfinder
             subfinder -d "$domain" -silent >> "$TMP_DIR/subfinder.txt" || true
-          done < targets.txt
+
+          done < db/targets.txt
 
           cat "$TMP_DIR"/*.txt 2>/dev/null \
-            | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/\.$//' \
             | grep -Eo '^([a-zA-Z0-9._-]+\.)+[a-zA-Z]{2,}$' \
-            | sort -u > sub_recon/subs_raw.txt
+            | sort -u > sub_recon/subs_raw.txt || true
 
       - name: DNS Resolution
         run: |
-          dnsx -l sub_recon/subs_raw.txt -silent -c 200 -o sub_recon/subs_resolved.txt || true
+          if [ -s sub_recon/subs_raw.txt ]; then
+            dnsx -l sub_recon/subs_raw.txt -silent -c 200 -o sub_recon/subs_resolved.txt || true
+          else
+            touch sub_recon/subs_resolved.txt
+          fi
 
       - name: Detect New Subdomains
         id: newsubs
         run: |
-          anew db/subdomains.txt < sub_recon/subs_resolved.txt > sub_recon/new_subs.txt
+          if [ -s sub_recon/subs_resolved.txt ]; then
+            anew db/subdomains.txt < sub_recon/subs_resolved.txt > sub_recon/new_subs.txt || true
+          else
+            touch sub_recon/new_subs.txt
+          fi
+
           if [ -s sub_recon/new_subs.txt ]; then
             COUNT=$(wc -l < sub_recon/new_subs.txt | xargs)
             echo "found=true" >> $GITHUB_OUTPUT
@@ -90,13 +111,23 @@ jobs:
 
       - name: HTTP Status Probe
         run: |
-          httpx -l sub_recon/subs_resolved.txt -status-code -silent -no-color > sub_recon/health_raw.txt || true
-          awk '{gsub(/\[|\]/, "", $2); print $1"|"$2}' sub_recon/health_raw.txt | sort -u > sub_recon/current_health.txt
+          if [ -s sub_recon/subs_resolved.txt ]; then
+            httpx -l sub_recon/subs_resolved.txt -status-code -silent -no-color > sub_recon/health_raw.txt || true
+            awk '{gsub(/\[|\]/, "", $2); print $1"|"$2}' sub_recon/health_raw.txt \
+              | sort -u > sub_recon/current_health.txt
+          else
+            touch sub_recon/current_health.txt
+          fi
 
       - name: Detect Status Changes
         id: health
         run: |
-          anew db/domain_health.txt < sub_recon/current_health.txt > sub_recon/health_changes.txt
+          if [ -s sub_recon/current_health.txt ]; then
+            anew db/domain_health.txt < sub_recon/current_health.txt > sub_recon/health_changes.txt || true
+          else
+            touch sub_recon/health_changes.txt
+          fi
+
           if [ -s sub_recon/health_changes.txt ]; then
             COUNT=$(wc -l < sub_recon/health_changes.txt | xargs)
             echo "changed=true" >> $GITHUB_OUTPUT
@@ -108,6 +139,7 @@ jobs:
 
       - name: Slack Notification
         if: steps.newsubs.outputs.found == 'true' || steps.health.outputs.changed == 'true'
+        continue-on-error: true
         uses: slackapi/slack-github-action@v2.1.1
         with:
           method: chat.postMessage
