@@ -21,87 +21,89 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           fetch-depth: 0
-
-      - name: Debug Repository Structure
-        run: |
-          echo "===== Repo Root ====="
-          ls -la
-          echo "===== DB Folder ====="
-          ls -la db || true
 
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq unzip curl
+          sudo apt-get install -y jq curl
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/tomnomnom/anew@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Prepare Directories
+      - name: Prepare
         run: |
           mkdir -p db sub_recon
-          touch db/subdomains.txt db/domain_health.txt
+          touch db/subdomains.txt
+          touch db/domain_health.txt
 
-      - name: Passive Subdomain Discovery
+      - name: Discover Subdomains
         run: |
           if [ ! -f db/targets.txt ]; then
-            echo "No db/targets.txt found. Skipping recon safely."
+            echo "❌ db/targets.txt not found"
             exit 0
           fi
 
-          TMP_DIR=$(mktemp -d)
-          : > "$TMP_DIR/crt.txt"
-          : > "$TMP_DIR/thc.txt"
-          : > "$TMP_DIR/subfinder.txt"
+          > sub_recon/all_sources.txt
 
-          while IFS= read -r domain || [ -n "$domain" ]; do
+          while read domain; do
+            domain=$(echo "$domain" | tr -d '\r')
             [ -z "$domain" ] && continue
 
-            echo "Recon on: $domain"
+            echo "🔍 Recon: $domain"
 
-            # crt.sh
-            curl -s --max-time 40 "https://crt.sh/?q=%25.${domain}&output=json" \
-              | jq -r '.[].name_value' 2>/dev/null \
-              | sed 's/\*\.//g' >> "$TMP_DIR/crt.txt" || true
+            # crt.sh (fixed JSON handling)
+            curl -s "https://crt.sh/?q=%25.${domain}&output=json" \
+              | tr -d '\n' \
+              | sed 's/}{/}\n{/g' \
+              | jq -r '.name_value' 2>/dev/null \
+              | sed 's/\*\.//g' >> sub_recon/all_sources.txt || true
 
-            # THC
-            curl -s --max-time 30 "https://ip.thc.org/sb/${domain}" \
-              | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" >> "$TMP_DIR/thc.txt" || true
+            # THC sb
+            curl -s "https://ip.thc.org/sb/${domain}" \
+              | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" >> sub_recon/all_sources.txt || true
+
+            # THC cn
+            curl -s "https://ip.thc.org/cn/${domain}" \
+              | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" >> sub_recon/all_sources.txt || true
 
             # Subfinder
-            subfinder -d "$domain" -silent >> "$TMP_DIR/subfinder.txt" || true
+            subfinder -d "$domain" -silent >> sub_recon/all_sources.txt || true
 
           done < db/targets.txt
 
-          cat "$TMP_DIR"/*.txt 2>/dev/null \
+          cat sub_recon/all_sources.txt \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/\.$//' \
             | grep -Eo '^([a-zA-Z0-9._-]+\.)+[a-zA-Z]{2,}$' \
-            | sort -u > sub_recon/subs_raw.txt || true
+            | sort -u > sub_recon/subs_raw.txt
+
+          echo "📊 Raw Subdomains:"
+          wc -l sub_recon/subs_raw.txt
 
       - name: DNS Resolution
         run: |
           if [ -s sub_recon/subs_raw.txt ]; then
-            dnsx -l sub_recon/subs_raw.txt -silent -c 200 -o sub_recon/subs_resolved.txt || true
+            dnsx -l sub_recon/subs_raw.txt -silent -retry 3 -threads 200 \
+              -o sub_recon/subs_resolved.txt
           else
             touch sub_recon/subs_resolved.txt
           fi
 
-      - name: Detect New Subdomains
+          echo "📊 Resolved Subdomains:"
+          wc -l sub_recon/subs_resolved.txt
+
+      - name: Save New Subdomains
         id: newsubs
         run: |
-          if [ -s sub_recon/subs_resolved.txt ]; then
-            anew db/subdomains.txt < sub_recon/subs_resolved.txt > sub_recon/new_subs.txt || true
-          else
-            touch sub_recon/new_subs.txt
-          fi
+          anew db/subdomains.txt < sub_recon/subs_resolved.txt > sub_recon/new.txt || true
 
-          if [ -s sub_recon/new_subs.txt ]; then
-            COUNT=$(wc -l < sub_recon/new_subs.txt | xargs)
+          COUNT=$(wc -l < sub_recon/new.txt | xargs)
+          echo "New subs: $COUNT"
+
+          if [ "$COUNT" -gt 0 ]; then
             echo "found=true" >> $GITHUB_OUTPUT
             echo "count=$COUNT" >> $GITHUB_OUTPUT
           else
@@ -109,27 +111,28 @@ jobs:
             echo "count=0" >> $GITHUB_OUTPUT
           fi
 
-      - name: HTTP Status Probe
+      - name: HTTP Probe
         run: |
           if [ -s sub_recon/subs_resolved.txt ]; then
-            httpx -l sub_recon/subs_resolved.txt -status-code -silent -no-color > sub_recon/health_raw.txt || true
-            awk '{gsub(/\[|\]/, "", $2); print $1"|"$2}' sub_recon/health_raw.txt \
-              | sort -u > sub_recon/current_health.txt
+            httpx -l sub_recon/subs_resolved.txt \
+              -silent -status-code -threads 200 -timeout 10 \
+              > sub_recon/http.txt
           else
-            touch sub_recon/current_health.txt
+            touch sub_recon/http.txt
           fi
+
+          awk '{gsub(/\[|\]/,"",$2); print $1"|"$2}' sub_recon/http.txt \
+            | sort -u > sub_recon/current_health.txt
 
       - name: Detect Status Changes
         id: health
         run: |
-          if [ -s sub_recon/current_health.txt ]; then
-            anew db/domain_health.txt < sub_recon/current_health.txt > sub_recon/health_changes.txt || true
-          else
-            touch sub_recon/health_changes.txt
-          fi
+          anew db/domain_health.txt < sub_recon/current_health.txt > sub_recon/changes.txt || true
 
-          if [ -s sub_recon/health_changes.txt ]; then
-            COUNT=$(wc -l < sub_recon/health_changes.txt | xargs)
+          COUNT=$(wc -l < sub_recon/changes.txt | xargs)
+          echo "Status changes: $COUNT"
+
+          if [ "$COUNT" -gt 0 ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "count=$COUNT" >> $GITHUB_OUTPUT
           else
@@ -147,14 +150,13 @@ jobs:
           payload: |
             {
               "channel": "C0A5M7P61N3",
-              "text": "🚀 *Recon Update Found*\n• New Subdomains: ${{ steps.newsubs.outputs.count }}\n• Status Changes: ${{ steps.health.outputs.count }}"
+              "text": "🚀 Recon Update\nNew Subs: ${{ steps.newsubs.outputs.count }}\nStatus Changes: ${{ steps.health.outputs.count }}"
             }
 
       - name: Commit Changes
-        if: steps.newsubs.outputs.found == 'true' || steps.health.outputs.changed == 'true'
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
           git add db/subdomains.txt db/domain_health.txt
-          git commit -m "Recon Update $(date -u +'%Y-%m-%d %H:%M UTC')" || exit 0
-          git push origin main
+          git diff --cached --quiet || git commit -m "Recon Update $(date -u)"
+          git push
