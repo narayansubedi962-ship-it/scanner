@@ -1,7 +1,7 @@
 name: Continuous Subdomain Recon
 on:
   schedule:
-    - cron: "0 */1 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -24,7 +24,7 @@ jobs:
 
       - name: Install Tools
         run: |
-          # ✅ Fix #1 — install jq, unzip, curl before anything uses them
+          # Fix #1 — jq, unzip, curl installed first before anything uses them
           sudo apt-get update -qq
           sudo apt-get install -y jq unzip curl
 
@@ -68,43 +68,73 @@ jobs:
       - name: Prepare Workspace
         run: |
           mkdir -p sub_recon db
+          # persistent stores — created if they don't exist yet
           touch db/all_subs.txt db/domain_health.txt
+
+          # Validate targets file exists and is not empty
+          if [ ! -f db/targets.txt ]; then
+            echo "ERROR: db/targets.txt not found."
+            echo "Create it with one domain per line, e.g.:"
+            echo "  nasa.gov"
+            echo "  example.com"
+            exit 1
+          fi
+          if [ ! -s db/targets.txt ]; then
+            echo "ERROR: db/targets.txt is empty."
+            exit 1
+          fi
+          echo "Targets to scan:"
+          cat db/targets.txt
 
       - name: Discover Subdomains
         run: |
-          TARGET="nasa.gov"
           > sub_recon/all_sources.txt
 
-          echo "[*] subfinder..."
-          subfinder -d "$TARGET" -silent >> sub_recon/all_sources.txt || true
+          while IFS= read -r TARGET || [ -n "$TARGET" ]; do
+            # skip blank lines and comment lines
+            [ -z "$TARGET" ] && continue
+            [[ "$TARGET" =~ ^#   ]] && continue
+            TARGET=$(echo "$TARGET" | tr -d '[:space:]')
 
-          echo "[*] crt.sh..."
-          curl -sf --retry 3 --max-time 30 \
-            "https://crt.sh/?q=%25.${TARGET}&output=json" \
-            | jq -r '.[].name_value' 2>/dev/null \
-            | sed 's/\*\.//g' \
-            >> sub_recon/all_sources.txt || true
+            echo ""
+            echo "=============================="
+            echo "[*] Processing: $TARGET"
+            echo "=============================="
 
-          echo "[*] THC /sb..."
-          curl -sf --retry 2 --max-time 20 \
-            "https://ip.thc.org/sb/${TARGET}" \
-            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
-            >> sub_recon/all_sources.txt || true
+            echo "[*] subfinder..."
+            subfinder -d "$TARGET" -silent \
+              >> sub_recon/all_sources.txt || true
 
-          echo "[*] THC /cn..."
-          curl -sf --retry 2 --max-time 20 \
-            "https://ip.thc.org/cn/${TARGET}" \
-            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
-            >> sub_recon/all_sources.txt || true
+            echo "[*] crt.sh..."
+            curl -sf --retry 3 --max-time 30 \
+              "https://crt.sh/?q=%25.${TARGET}&output=json" \
+              | jq -r '.[].name_value' 2>/dev/null \
+              | sed 's/\*\.//g' \
+              >> sub_recon/all_sources.txt || true
 
-          # Normalize: strip wildcards, lowercase, remove blanks/junk, dedup
+            echo "[*] THC /sb..."
+            curl -sf --retry 2 --max-time 20 \
+              "https://ip.thc.org/sb/${TARGET}" \
+              | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+              >> sub_recon/all_sources.txt || true
+
+            echo "[*] THC /cn..."
+            curl -sf --retry 2 --max-time 20 \
+              "https://ip.thc.org/cn/${TARGET}" \
+              | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+              >> sub_recon/all_sources.txt || true
+
+          done < db/targets.txt
+
+          # Normalize: strip wildcards, lowercase, remove whitespace/junk, dedup
           sed 's/\*\.//g' sub_recon/all_sources.txt \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/\.$//; s/[[:space:]]//g' \
             | grep -E '^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$' \
             | sort -u > sub_recon/subs_raw.txt
 
-          echo "Raw unique count: $(wc -l < sub_recon/subs_raw.txt)"
+          echo ""
+          echo "Raw unique subdomains: $(wc -l < sub_recon/subs_raw.txt)"
 
       - name: DNS Resolve (dnsx)
         run: |
@@ -161,8 +191,8 @@ jobs:
       - name: Detect HTTP Status Changes
         id: health_changes
         run: |
-          # ✅ Fix #2 — proper change detection (not just anew)
-          # ✅ Fix #3 — first-run guard lives here, not in the if: condition
+          # Fix #2 — proper change detection using grep diff, not anew
+          # Fix #3 — first-run guard lives here, not on the Slack if: condition
           if [ ! -s db/domain_health.txt ]; then
             echo "First run — seeding health baseline, skipping alert."
             cp sub_recon/current_health.txt db/domain_health.txt
@@ -171,7 +201,7 @@ jobs:
             exit 0
           fi
 
-          # Lines in current that are not in the baseline = new or changed entries
+          # Lines in current not in baseline = new hosts or status code changes
           grep -Fvxf db/domain_health.txt sub_recon/current_health.txt \
             > sub_recon/health_changes.txt || true
 
@@ -181,7 +211,7 @@ jobs:
             echo "changes_count=$COUNT" >> $GITHUB_OUTPUT
             echo "--- Status changes ---"
             cat sub_recon/health_changes.txt
-            # Overwrite baseline with latest snapshot
+            # Overwrite baseline with latest snapshot for next run
             cp sub_recon/current_health.txt db/domain_health.txt
           else
             echo "changes_found=false" >> $GITHUB_OUTPUT
@@ -198,13 +228,13 @@ jobs:
           payload: |
             {
               "channel_id": "C0A5M7P61N3",
-              "initial_comment": "🎯 *New subdomains* for nasa.gov — ${{ steps.new_subs.outputs.new_count }} found",
+              "initial_comment": "🎯 *New subdomains discovered* — ${{ steps.new_subs.outputs.new_count }} new across all targets",
               "file": "./sub_recon/new_subs.txt",
               "filename": "new_subdomains.txt"
             }
 
       - name: Upload HTTP Status Changes to Slack
-        # ✅ Fix #3 — IS_FIRST_RUN guard removed; handled inside the step above
+        # Fix #3 — IS_FIRST_RUN check removed; handled inside the step itself
         if: steps.health_changes.outputs.changes_found == 'true'
         uses: slackapi/slack-github-action@v2.1.1
         with:
@@ -213,7 +243,7 @@ jobs:
           payload: |
             {
               "channel_id": "C0A5M7P61N3",
-              "initial_comment": "🔄 *HTTP status changes* for nasa.gov — ${{ steps.health_changes.outputs.changes_count }} change(s)",
+              "initial_comment": "🔄 *HTTP status changes detected* — ${{ steps.health_changes.outputs.changes_count }} change(s) across all targets",
               "file": "./sub_recon/health_changes.txt",
               "filename": "http_status_changes.txt"
             }
@@ -231,8 +261,8 @@ jobs:
       - name: Cleanup Temporary Files
         if: always()
         run: |
-          rm -f sub_recon/all_sources.txt \
-                sub_recon/subs_raw.txt    \
-                sub_recon/http_raw.txt    \
-                sub_recon/new_subs.txt    \
+          rm -f sub_recon/all_sources.txt  \
+                sub_recon/subs_raw.txt     \
+                sub_recon/http_raw.txt     \
+                sub_recon/new_subs.txt     \
                 sub_recon/health_changes.txt
