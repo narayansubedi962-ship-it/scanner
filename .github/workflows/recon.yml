@@ -2,7 +2,7 @@ name: Continuous Subdomain Recon
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */1 * * *"   # Every hour
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
       - name: Checkout Repository
@@ -23,140 +23,161 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Dependencies
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq unzip curl
+
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install github.com/tomnomnom/anew@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Prepare
+      - name: Prepare Directories
         run: |
-          mkdir -p db sub_recon
-          touch db/subdomains.txt
-          touch db/domain_health.txt
+          mkdir -p db
+          touch db/all_subs.txt
+          touch db/domain_status.txt
 
-      - name: Discover Subdomains
+      # =============================
+      # 1️⃣ Subdomain Discovery
+      # =============================
+      - name: Run Subfinder
         run: |
-          if [ ! -f db/targets.txt ]; then
-            echo "❌ db/targets.txt not found"
-            exit 0
-          fi
+          subfinder -d nasa.gov -silent > current_subs.txt
 
-          > sub_recon/all_sources.txt
+          echo "Raw discovered:"
+          wc -l current_subs.txt
 
-          while read domain; do
-            domain=$(echo "$domain" | tr -d '\r')
-            [ -z "$domain" ] && continue
-
-            echo "🔍 Recon: $domain"
-
-            # crt.sh (fixed JSON handling)
-            curl -s "https://crt.sh/?q=%25.${domain}&output=json" \
-              | tr -d '\n' \
-              | sed 's/}{/}\n{/g' \
-              | jq -r '.name_value' 2>/dev/null \
-              | sed 's/\*\.//g' >> sub_recon/all_sources.txt || true
-
-            # THC sb
-            curl -s "https://ip.thc.org/sb/${domain}" \
-              | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" >> sub_recon/all_sources.txt || true
-
-            # THC cn
-            curl -s "https://ip.thc.org/cn/${domain}" \
-              | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" >> sub_recon/all_sources.txt || true
-
-            # Subfinder
-            subfinder -d "$domain" -silent >> sub_recon/all_sources.txt || true
-
-          done < db/targets.txt
-
-          cat sub_recon/all_sources.txt \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's/\.$//' \
-            | grep -Eo '^([a-zA-Z0-9._-]+\.)+[a-zA-Z]{2,}$' \
-            | sort -u > sub_recon/subs_raw.txt
-
-          echo "📊 Raw Subdomains:"
-          wc -l sub_recon/subs_raw.txt
-
-      - name: DNS Resolution
+      # =============================
+      # 2️⃣ DNS Resolution
+      # =============================
+      - name: Resolve with dnsx
         run: |
-          if [ -s sub_recon/subs_raw.txt ]; then
-            dnsx -l sub_recon/subs_raw.txt -silent -retry 3 -threads 200 \
-              -o sub_recon/subs_resolved.txt
+          if [ -s current_subs.txt ]; then
+            dnsx -l current_subs.txt -silent -retry 2 -o resolved_subs.txt
           else
-            touch sub_recon/subs_resolved.txt
+            touch resolved_subs.txt
           fi
 
-          echo "📊 Resolved Subdomains:"
-          wc -l sub_recon/subs_resolved.txt
+          echo "Resolved domains:"
+          wc -l resolved_subs.txt
 
-      - name: Save New Subdomains
-        id: newsubs
+      # =============================
+      # 3️⃣ Detect New Subdomains
+      # =============================
+      - name: Compare New Subdomains
+        id: compare
         run: |
-          anew db/subdomains.txt < sub_recon/subs_resolved.txt > sub_recon/new.txt || true
-
-          COUNT=$(wc -l < sub_recon/new.txt | xargs)
-          echo "New subs: $COUNT"
-
-          if [ "$COUNT" -gt 0 ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "count=$COUNT" >> $GITHUB_OUTPUT
+          if [ ! -s db/all_subs.txt ]; then
+            echo "FIRST_RUN=true" >> $GITHUB_ENV
           else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "count=0" >> $GITHUB_OUTPUT
+            echo "FIRST_RUN=false" >> $GITHUB_ENV
           fi
 
-      - name: HTTP Probe
+          grep -Fvxf db/all_subs.txt resolved_subs.txt > new_subs.txt || true
+
+          if [ -s new_subs.txt ]; then
+            COUNT=$(wc -l < new_subs.txt | xargs)
+            echo "new_found=true" >> $GITHUB_OUTPUT
+            echo "new_count=$COUNT" >> $GITHUB_OUTPUT
+
+            cat new_subs.txt >> db/all_subs.txt
+            sort -u db/all_subs.txt -o db/all_subs.txt
+          else
+            echo "new_found=false" >> $GITHUB_OUTPUT
+            echo "new_count=0" >> $GITHUB_OUTPUT
+          fi
+
+      # =============================
+      # 4️⃣ HTTP Status Check
+      # =============================
+      - name: Check HTTP Status (httpx)
         run: |
-          if [ -s sub_recon/subs_resolved.txt ]; then
-            httpx -l sub_recon/subs_resolved.txt \
-              -silent -status-code -threads 200 -timeout 10 \
-              > sub_recon/http.txt
+          if [ -s db/all_subs.txt ]; then
+            httpx -l db/all_subs.txt -silent -status-code \
+              -threads 100 -timeout 10 > current_status.txt
           else
-            touch sub_recon/http.txt
+            touch current_status.txt
           fi
 
-          awk '{gsub(/\[|\]/,"",$2); print $1"|"$2}' sub_recon/http.txt \
-            | sort -u > sub_recon/current_health.txt
+          awk '{gsub(/\[|\]/,"",$2); print $1"|"$2}' current_status.txt \
+            | sort -u > formatted_status.txt
 
+      # =============================
+      # 5️⃣ Detect Status Changes
+      # =============================
       - name: Detect Status Changes
-        id: health
+        id: status
         run: |
-          anew db/domain_health.txt < sub_recon/current_health.txt > sub_recon/changes.txt || true
-
-          COUNT=$(wc -l < sub_recon/changes.txt | xargs)
-          echo "Status changes: $COUNT"
-
-          if [ "$COUNT" -gt 0 ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "count=$COUNT" >> $GITHUB_OUTPUT
+          if [ ! -s db/domain_status.txt ]; then
+            echo "FIRST_STATUS_RUN=true" >> $GITHUB_ENV
           else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "count=0" >> $GITHUB_OUTPUT
+            echo "FIRST_STATUS_RUN=false" >> $GITHUB_ENV
           fi
 
-      - name: Slack Notification
-        if: steps.newsubs.outputs.found == 'true' || steps.health.outputs.changed == 'true'
-        continue-on-error: true
+          grep -Fvxf db/domain_status.txt formatted_status.txt > status_changes.txt || true
+
+          if [ -s status_changes.txt ]; then
+            COUNT=$(wc -l < status_changes.txt | xargs)
+            echo "status_changed=true" >> $GITHUB_OUTPUT
+            echo "status_count=$COUNT" >> $GITHUB_OUTPUT
+
+            cat formatted_status.txt > db/domain_status.txt
+          else
+            echo "status_changed=false" >> $GITHUB_OUTPUT
+            echo "status_count=0" >> $GITHUB_OUTPUT
+          fi
+
+      # =============================
+      # 6️⃣ Slack Alert
+      # =============================
+      - name: Upload New Subs to Slack
+        if: steps.compare.outputs.new_found == 'true' && env.FIRST_RUN == 'false'
         uses: slackapi/slack-github-action@v2.1.1
         with:
-          method: chat.postMessage
+          method: files.uploadV2
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload: |
             {
-              "channel": "C0A5M7P61N3",
-              "text": "🚀 Recon Update\nNew Subs: ${{ steps.newsubs.outputs.count }}\nStatus Changes: ${{ steps.health.outputs.count }}"
+              "channel_id": "C0A5M7P61N3",
+              "initial_comment": "🎯 New subdomains discovered (Total: ${{ steps.compare.outputs.new_count }})",
+              "file": "./new_subs.txt",
+              "filename": "new_subdomains.txt"
             }
 
-      - name: Commit Changes
+      - name: Upload Status Changes to Slack
+        if: steps.status.outputs.status_changed == 'true' && env.FIRST_STATUS_RUN == 'false'
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: files.uploadV2
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel_id": "C0A5M7P61N3",
+              "initial_comment": "⚡ HTTP Status Changes Detected (Total: ${{ steps.status.outputs.status_count }})",
+              "file": "./status_changes.txt",
+              "filename": "status_changes.txt"
+            }
+
+      # =============================
+      # 7️⃣ Commit Changes
+      # =============================
+      - name: Commit and Push Changes
+        if: steps.compare.outputs.new_found == 'true' || steps.status.outputs.status_changed == 'true'
         run: |
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
-          git add db/subdomains.txt db/domain_health.txt
-          git diff --cached --quiet || git commit -m "Recon Update $(date -u)"
-          git push
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add db/all_subs.txt db/domain_status.txt
+          git diff --cached --quiet || git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M')"
+          git push origin main
+
+      # =============================
+      # 8️⃣ Cleanup
+      # =============================
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f current_subs.txt resolved_subs.txt new_subs.txt
+          rm -f current_status.txt formatted_status.txt status_changes.txt
