@@ -29,7 +29,7 @@ jobs:
       # --------------------------------------------------
       - name: Install Dependencies
         run: |
-          sudo apt update
+          sudo apt-update
           sudo apt install -y jq unzip
 
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -59,6 +59,12 @@ jobs:
           > $TMP_DIR/crt.txt
           > $TMP_DIR/thc.txt
           > $TMP_DIR/subfinder.txt
+
+          # Note: Ensure targets.txt exists in the root of your repo
+          if [ ! -f targets.txt ]; then
+            echo "Error: targets.txt not found!"
+            exit 1
+          fi
 
           while read -r domain; do
             [ -z "$domain" ] && continue
@@ -122,7 +128,7 @@ jobs:
       - name: HTTP Status Probe
         run: |
           cat sub_recon/subs_resolved.txt \
-          | httpx -http -https -status-code -silent -no-color \
+          | httpx -status-code -silent -no-color \
           > sub_recon/health_raw.txt || true
 
           awk '{gsub(/\[|\]/,"",$2); print $1"|"$2}' \
@@ -160,7 +166,7 @@ jobs:
           payload: |
             {
               "channel": "C0A5M7P61N3",
-              "text": "🚀 Recon Update\nNew Subs: ${{ steps.newsubs.outputs.count }}\nStatus Changes: ${{ steps.health.outputs.count }}"
+              "text": "🚀 Recon Update\nNew Subs: ${{ steps.newsubs.outputs.count || 0 }}\nStatus Changes: ${{ steps.health.outputs.count || 0 }}"
             }
 
       # --------------------------------------------------
@@ -173,5 +179,5 @@ jobs:
           git config --local user.name "GitHub Action"
 
           git add db/subdomains.txt db/domain_health.txt
-          git commit -m "Recon Update $(date +'%Y-%m-%d %H:%M')"
+          git commit -m "Recon Update $(date +'%Y-%m-%d %H:%M')" || true
           git push origin main
