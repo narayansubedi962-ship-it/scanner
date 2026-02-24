@@ -1,8 +1,7 @@
 name: Continuous Subdomain Recon
-
 on:
   schedule:
-    - cron: "0 */1 * * *"   # Every hour
+    - cron: "0 */1 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -15,125 +14,183 @@ permissions:
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 55
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
+          persist-credentials: true
           fetch-depth: 0
 
       - name: Install Tools
         run: |
+          # ✅ Fix #1 — install jq, unzip, curl before anything uses them
           sudo apt-get update -qq
           sudo apt-get install -y jq unzip curl
 
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          # --- subfinder (latest binary) ---
+          SF_VER=$(curl -sf https://api.github.com/repos/projectdiscovery/subfinder/releases/latest \
+            | jq -r '.tag_name' | sed 's/v//')
+          curl -sL "https://github.com/projectdiscovery/subfinder/releases/download/v${SF_VER}/subfinder_${SF_VER}_linux_amd64.zip" \
+            -o /tmp/subfinder.zip
+          unzip -oq /tmp/subfinder.zip -d /tmp/sf
+          sudo mv /tmp/sf/subfinder /usr/local/bin/subfinder
+          rm -rf /tmp/subfinder.zip /tmp/sf
+
+          # --- dnsx (latest binary) ---
+          DX_VER=$(curl -sf https://api.github.com/repos/projectdiscovery/dnsx/releases/latest \
+            | jq -r '.tag_name' | sed 's/v//')
+          curl -sL "https://github.com/projectdiscovery/dnsx/releases/download/v${DX_VER}/dnsx_${DX_VER}_linux_amd64.zip" \
+            -o /tmp/dnsx.zip
+          unzip -oq /tmp/dnsx.zip -d /tmp/dx
+          sudo mv /tmp/dx/dnsx /usr/local/bin/dnsx
+          rm -rf /tmp/dnsx.zip /tmp/dx
+
+          # --- httpx (latest binary) ---
+          HX_VER=$(curl -sf https://api.github.com/repos/projectdiscovery/httpx/releases/latest \
+            | jq -r '.tag_name' | sed 's/v//')
+          curl -sL "https://github.com/projectdiscovery/httpx/releases/download/v${HX_VER}/httpx_${HX_VER}_linux_amd64.zip" \
+            -o /tmp/httpx.zip
+          unzip -oq /tmp/httpx.zip -d /tmp/hx
+          sudo mv /tmp/hx/httpx /usr/local/bin/httpx
+          rm -rf /tmp/httpx.zip /tmp/hx
+
+          # --- anew ---
+          go install github.com/tomnomnom/anew@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Prepare Directories
-        run: |
-          mkdir -p db
-          touch db/all_subs.txt
-          touch db/domain_status.txt
+          # verify installs
+          subfinder -version 2>&1 | head -1
+          dnsx    -version 2>&1 | head -1
+          httpx   -version 2>&1 | head -1
+          jq      --version
 
-      # =============================
-      # 1️⃣ Subdomain Discovery
-      # =============================
-      - name: Run Subfinder
+      - name: Prepare Workspace
         run: |
-          subfinder -d nasa.gov -silent > current_subs.txt
+          mkdir -p sub_recon db
+          touch db/all_subs.txt db/domain_health.txt
 
-          echo "Raw discovered:"
-          wc -l current_subs.txt
-
-      # =============================
-      # 2️⃣ DNS Resolution
-      # =============================
-      - name: Resolve with dnsx
+      - name: Discover Subdomains
         run: |
-          if [ -s current_subs.txt ]; then
-            dnsx -l current_subs.txt -silent -retry 2 -o resolved_subs.txt
+          TARGET="nasa.gov"
+          > sub_recon/all_sources.txt
+
+          echo "[*] subfinder..."
+          subfinder -d "$TARGET" -silent >> sub_recon/all_sources.txt || true
+
+          echo "[*] crt.sh..."
+          curl -sf --retry 3 --max-time 30 \
+            "https://crt.sh/?q=%25.${TARGET}&output=json" \
+            | jq -r '.[].name_value' 2>/dev/null \
+            | sed 's/\*\.//g' \
+            >> sub_recon/all_sources.txt || true
+
+          echo "[*] THC /sb..."
+          curl -sf --retry 2 --max-time 20 \
+            "https://ip.thc.org/sb/${TARGET}" \
+            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+            >> sub_recon/all_sources.txt || true
+
+          echo "[*] THC /cn..."
+          curl -sf --retry 2 --max-time 20 \
+            "https://ip.thc.org/cn/${TARGET}" \
+            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+            >> sub_recon/all_sources.txt || true
+
+          # Normalize: strip wildcards, lowercase, remove blanks/junk, dedup
+          sed 's/\*\.//g' sub_recon/all_sources.txt \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/\.$//; s/[[:space:]]//g' \
+            | grep -E '^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$' \
+            | sort -u > sub_recon/subs_raw.txt
+
+          echo "Raw unique count: $(wc -l < sub_recon/subs_raw.txt)"
+
+      - name: DNS Resolve (dnsx)
+        run: |
+          if [ -s sub_recon/subs_raw.txt ]; then
+            dnsx -l sub_recon/subs_raw.txt \
+              -silent -retry 3 \
+              -o sub_recon/subs_resolved.txt
           else
-            touch resolved_subs.txt
+            touch sub_recon/subs_resolved.txt
           fi
+          echo "Resolved count: $(wc -l < sub_recon/subs_resolved.txt)"
 
-          echo "Resolved domains:"
-          wc -l resolved_subs.txt
-
-      # =============================
-      # 3️⃣ Detect New Subdomains
-      # =============================
-      - name: Compare New Subdomains
-        id: compare
+      - name: Detect New Subdomains
+        id: new_subs
         run: |
           if [ ! -s db/all_subs.txt ]; then
-            echo "FIRST_RUN=true" >> $GITHUB_ENV
+            echo "IS_FIRST_RUN=true" >> $GITHUB_ENV
           else
-            echo "FIRST_RUN=false" >> $GITHUB_ENV
+            echo "IS_FIRST_RUN=false" >> $GITHUB_ENV
           fi
 
-          grep -Fvxf db/all_subs.txt resolved_subs.txt > new_subs.txt || true
+          anew db/all_subs.txt < sub_recon/subs_resolved.txt \
+            > sub_recon/new_subs.txt || true
 
-          if [ -s new_subs.txt ]; then
-            COUNT=$(wc -l < new_subs.txt | xargs)
-            echo "new_found=true" >> $GITHUB_OUTPUT
+          if [ -s sub_recon/new_subs.txt ]; then
+            COUNT=$(wc -l < sub_recon/new_subs.txt | xargs)
+            echo "new_found=true"   >> $GITHUB_OUTPUT
             echo "new_count=$COUNT" >> $GITHUB_OUTPUT
-
-            cat new_subs.txt >> db/all_subs.txt
-            sort -u db/all_subs.txt -o db/all_subs.txt
+            echo "--- New subdomains ---"
+            cat sub_recon/new_subs.txt
           else
             echo "new_found=false" >> $GITHUB_OUTPUT
-            echo "new_count=0" >> $GITHUB_OUTPUT
+            echo "new_count=0"     >> $GITHUB_OUTPUT
+            echo "No new subdomains."
           fi
 
-      # =============================
-      # 4️⃣ HTTP Status Check
-      # =============================
-      - name: Check HTTP Status (httpx)
+      - name: Probe HTTP Status (httpx)
         run: |
-          if [ -s db/all_subs.txt ]; then
-            httpx -l db/all_subs.txt -silent -status-code \
-              -threads 100 -timeout 10 > current_status.txt
+          if [ -s sub_recon/subs_resolved.txt ]; then
+            httpx -l sub_recon/subs_resolved.txt \
+              -silent -status-code \
+              -threads 100 -timeout 10 \
+              > sub_recon/http_raw.txt
           else
-            touch current_status.txt
+            touch sub_recon/http_raw.txt
           fi
 
-          awk '{gsub(/\[|\]/,"",$2); print $1"|"$2}' current_status.txt \
-            | sort -u > formatted_status.txt
+          # Normalize: "https://host.com [200]" → "https://host.com|200"
+          sed 's/ \[/|/; s/\]//' sub_recon/http_raw.txt \
+            | sort -u > sub_recon/current_health.txt
 
-      # =============================
-      # 5️⃣ Detect Status Changes
-      # =============================
-      - name: Detect Status Changes
-        id: status
+          echo "HTTP-alive count: $(wc -l < sub_recon/current_health.txt)"
+
+      - name: Detect HTTP Status Changes
+        id: health_changes
         run: |
-          if [ ! -s db/domain_status.txt ]; then
-            echo "FIRST_STATUS_RUN=true" >> $GITHUB_ENV
-          else
-            echo "FIRST_STATUS_RUN=false" >> $GITHUB_ENV
+          # ✅ Fix #2 — proper change detection (not just anew)
+          # ✅ Fix #3 — first-run guard lives here, not in the if: condition
+          if [ ! -s db/domain_health.txt ]; then
+            echo "First run — seeding health baseline, skipping alert."
+            cp sub_recon/current_health.txt db/domain_health.txt
+            echo "changes_found=false" >> $GITHUB_OUTPUT
+            echo "changes_count=0"     >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          grep -Fvxf db/domain_status.txt formatted_status.txt > status_changes.txt || true
+          # Lines in current that are not in the baseline = new or changed entries
+          grep -Fvxf db/domain_health.txt sub_recon/current_health.txt \
+            > sub_recon/health_changes.txt || true
 
-          if [ -s status_changes.txt ]; then
-            COUNT=$(wc -l < status_changes.txt | xargs)
-            echo "status_changed=true" >> $GITHUB_OUTPUT
-            echo "status_count=$COUNT" >> $GITHUB_OUTPUT
-
-            cat formatted_status.txt > db/domain_status.txt
+          if [ -s sub_recon/health_changes.txt ]; then
+            COUNT=$(wc -l < sub_recon/health_changes.txt | xargs)
+            echo "changes_found=true"   >> $GITHUB_OUTPUT
+            echo "changes_count=$COUNT" >> $GITHUB_OUTPUT
+            echo "--- Status changes ---"
+            cat sub_recon/health_changes.txt
+            # Overwrite baseline with latest snapshot
+            cp sub_recon/current_health.txt db/domain_health.txt
           else
-            echo "status_changed=false" >> $GITHUB_OUTPUT
-            echo "status_count=0" >> $GITHUB_OUTPUT
+            echo "changes_found=false" >> $GITHUB_OUTPUT
+            echo "changes_count=0"     >> $GITHUB_OUTPUT
+            echo "No status changes."
           fi
 
-      # =============================
-      # 6️⃣ Slack Alert
-      # =============================
-      - name: Upload New Subs to Slack
-        if: steps.compare.outputs.new_found == 'true' && env.FIRST_RUN == 'false'
+      - name: Upload New Subdomains to Slack
+        if: steps.new_subs.outputs.new_found == 'true' && env.IS_FIRST_RUN == 'false'
         uses: slackapi/slack-github-action@v2.1.1
         with:
           method: files.uploadV2
@@ -141,13 +198,14 @@ jobs:
           payload: |
             {
               "channel_id": "C0A5M7P61N3",
-              "initial_comment": "🎯 New subdomains discovered (Total: ${{ steps.compare.outputs.new_count }})",
-              "file": "./new_subs.txt",
+              "initial_comment": "🎯 *New subdomains* for nasa.gov — ${{ steps.new_subs.outputs.new_count }} found",
+              "file": "./sub_recon/new_subs.txt",
               "filename": "new_subdomains.txt"
             }
 
-      - name: Upload Status Changes to Slack
-        if: steps.status.outputs.status_changed == 'true' && env.FIRST_STATUS_RUN == 'false'
+      - name: Upload HTTP Status Changes to Slack
+        # ✅ Fix #3 — IS_FIRST_RUN guard removed; handled inside the step above
+        if: steps.health_changes.outputs.changes_found == 'true'
         uses: slackapi/slack-github-action@v2.1.1
         with:
           method: files.uploadV2
@@ -155,29 +213,26 @@ jobs:
           payload: |
             {
               "channel_id": "C0A5M7P61N3",
-              "initial_comment": "⚡ HTTP Status Changes Detected (Total: ${{ steps.status.outputs.status_count }})",
-              "file": "./status_changes.txt",
-              "filename": "status_changes.txt"
+              "initial_comment": "🔄 *HTTP status changes* for nasa.gov — ${{ steps.health_changes.outputs.changes_count }} change(s)",
+              "file": "./sub_recon/health_changes.txt",
+              "filename": "http_status_changes.txt"
             }
 
-      # =============================
-      # 7️⃣ Commit Changes
-      # =============================
-      - name: Commit and Push Changes
-        if: steps.compare.outputs.new_found == 'true' || steps.status.outputs.status_changed == 'true'
+      - name: Commit Persistent Stores
+        if: steps.new_subs.outputs.new_found == 'true' || steps.health_changes.outputs.changes_found == 'true'
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-
-          git add db/all_subs.txt db/domain_status.txt
-          git diff --cached --quiet || git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M')"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+          git add db/all_subs.txt db/domain_health.txt
+          git diff --cached --quiet || git commit -m \
+            "recon: $(date -u '+%Y-%m-%d %H:%M UTC') | +${{ steps.new_subs.outputs.new_count }} subs | ${{ steps.health_changes.outputs.changes_count }} status changes"
           git push origin main
 
-      # =============================
-      # 8️⃣ Cleanup
-      # =============================
-      - name: Cleanup
+      - name: Cleanup Temporary Files
         if: always()
         run: |
-          rm -f current_subs.txt resolved_subs.txt new_subs.txt
-          rm -f current_status.txt formatted_status.txt status_changes.txt
+          rm -f sub_recon/all_sources.txt \
+                sub_recon/subs_raw.txt    \
+                sub_recon/http_raw.txt    \
+                sub_recon/new_subs.txt    \
+                sub_recon/health_changes.txt
