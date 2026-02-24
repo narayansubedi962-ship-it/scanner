@@ -29,7 +29,7 @@ jobs:
       # --------------------------------------------------
       - name: Install Dependencies
         run: |
-          sudo apt-update
+          sudo apt update
           sudo apt install -y jq unzip
 
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -49,7 +49,7 @@ jobs:
           touch db/domain_health.txt
 
       # --------------------------------------------------
-      # Passive Subdomain Discovery (crt.sh + THC + subfinder)
+      # Passive Subdomain Discovery
       # --------------------------------------------------
       - name: Passive Subdomain Discovery
         run: |
@@ -60,9 +60,8 @@ jobs:
           > $TMP_DIR/thc.txt
           > $TMP_DIR/subfinder.txt
 
-          # Note: Ensure targets.txt exists in the root of your repo
           if [ ! -f targets.txt ]; then
-            echo "Error: targets.txt not found!"
+            echo "Error: targets.txt not found in root!"
             exit 1
           fi
 
@@ -77,10 +76,6 @@ jobs:
 
             echo "🌐 THC: $domain"
             curl -s --max-time 30 "https://ip.thc.org/sb/${domain}" \
-            | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" \
-            >> $TMP_DIR/thc.txt || true
-
-            curl -s --max-time 30 "https://ip.thc.org/cn/${domain}" \
             | grep -Eo "([a-zA-Z0-9._-]+\.)+${domain}" \
             >> $TMP_DIR/thc.txt || true
 
@@ -120,6 +115,7 @@ jobs:
             echo "count=$COUNT" >> $GITHUB_OUTPUT
           else
             echo "found=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
           fi
 
       # --------------------------------------------------
@@ -127,6 +123,7 @@ jobs:
       # --------------------------------------------------
       - name: HTTP Status Probe
         run: |
+          # Probes both 80 and 443 by default
           cat sub_recon/subs_resolved.txt \
           | httpx -status-code -silent -no-color \
           > sub_recon/health_raw.txt || true
@@ -152,6 +149,7 @@ jobs:
             echo "count=$COUNT" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
           fi
 
       # --------------------------------------------------
@@ -166,18 +164,18 @@ jobs:
           payload: |
             {
               "channel": "C0A5M7P61N3",
-              "text": "🚀 Recon Update\nNew Subs: ${{ steps.newsubs.outputs.count || 0 }}\nStatus Changes: ${{ steps.health.outputs.count || 0 }}"
+              "text": "🚀 *Recon Update Found*\n• New Subdomains: ${{ steps.newsubs.outputs.count }}\n• Status Changes: ${{ steps.health.outputs.count }}"
             }
 
       # --------------------------------------------------
       # Commit Changes
       # --------------------------------------------------
       - name: Commit Changes
-        if: steps.newsubs.outputs.found == 'true' || steps.health.outputs.changed == 'true'
+        if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
           git add db/subdomains.txt db/domain_health.txt
-          git commit -m "Recon Update $(date +'%Y-%m-%d %H:%M')" || true
-          git push origin main
+          git commit -m "Recon Update $(date +'%Y-%m-%d %H:%M')" || echo "No changes to commit"
+          git push origin main || echo "No changes to push"
